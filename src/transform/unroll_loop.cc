@@ -101,6 +101,51 @@ private:
 // The Visitor is used to check whether var is used as write index in a local
 // memory If a loop var is used as indices to a local memory, it must be
 // unrolled so the local memory access can be turned into register access.
+/*!
+ * \brief Deduplicate DeclBuffer names after loop unrolling.
+ *
+ * When a loop body containing DeclBuffer statements is unrolled,
+ * the Substitute call creates deep copies that preserve buffer names.
+ * This results in duplicate DeclBuffer names (SSA violation) in the
+ * flattened result.  This mutator renames duplicates and remaps
+ * BufferLoad/BufferStore references accordingly.
+ *
+ * This is intentionally simple (no scope tracking) because the
+ * unrolled body is flat — all DeclBuffers are siblings in a SeqStmt.
+ * ConvertSSA handles all remaining SSA normalization downstream.
+ */
+class DeclBufferDeduper : public StmtExprMutator {
+public:
+  Stmt VisitStmt_(const DeclBufferNode *op) final {
+    const std::string &name = op->buffer->name;
+    if (seen_.count(name)) {
+      // Duplicate: create a renamed clone and record the mapping
+      Buffer new_buf = op->buffer;
+      auto w = new_buf.CopyOnWrite();
+      w->name = name + "_" + std::to_string(next_id_++);
+      buf_remap_[op->buffer.get()] = new_buf;
+      return DeclBuffer(std::move(new_buf));
+    } else {
+      seen_.insert(name);
+      return GetRef<Stmt>(op);
+    }
+  }
+
+  Buffer VisitBufferUse(const Buffer &buffer) override {
+    auto it = buf_remap_.find(buffer.get());
+    if (it != buf_remap_.end())
+      return it->second;
+    // Fall through: base class VisitBufferUse checks buffer_remap_
+    // which handles AllocBuffer/SBlock expression-driven remaps.
+    return StmtExprMutator::VisitBufferUse(buffer);
+  }
+
+private:
+  std::unordered_set<std::string> seen_;
+  std::unordered_map<const BufferNode *, Buffer> buf_remap_;
+  int next_id_{0};
+};
+
 class LoopUnroller : public StmtExprMutator {
 public:
   explicit LoopUnroller(int auto_max_step, int auto_max_depth,
@@ -246,7 +291,11 @@ public:
       Stmt step = Substitute(body, vmap);
       unrolled.push_back(step);
     }
-    return SeqStmt::Flatten(unrolled);
+    Stmt result = SeqStmt::Flatten(unrolled);
+    // Deduplicate DeclBuffer names introduced by body copying.
+    // Substitute preserves buffer names on deep copy, producing duplicates
+    // that violate SSA.  Rename them here before ConvertSSA runs.
+    return DeclBufferDeduper()(std::move(result));
   }
 
 private:
